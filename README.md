@@ -1,154 +1,154 @@
-# Consistent Hashing ile Sharding — .NET Demo
+# Sharding with Consistent Hashing — .NET Demo
 
-Veriyi birden çok veritabanına (shard) dağıtırken kullanılan **consistent hashing** algoritmasını sıfırdan yazan; bu kütüphaneyi gerçek bir **ASP.NET Core Web API** ve **3 ayrı PostgreSQL** örneği üzerinde çalıştıran küçük bir demo.
+A small demo that implements the **consistent hashing** algorithm from scratch and uses it to distribute data across multiple databases (shards). The algorithm runs inside a real **ASP.NET Core Web API** backed by **three separate PostgreSQL** instances.
 
-> Amaç: "sharding nasıl çalışır, neden `hash % N` yetmez, consistent hashing ne kazandırır" sorularını **çalışan kodla** göstermek.
-
----
-
-## İçindekiler
-
-- [Neyi gösteriyor?](#neyi-gösteriyor)
-- [Consistent hashing 60 saniyede](#consistent-hashing-60-saniyede)
-- [Mimari](#mimari)
-- [Çalıştırma](#çalıştırma)
-- [API uçları](#api-uçları)
-- [Denemeye değer senaryolar](#denemeye-değer-senaryolar)
-- [Proje yapısı](#proje-yapısı)
-- [Testler](#testler)
+> Goal: show — with working code — how sharding works, why `hash % N` isn't enough, and what consistent hashing buys you.
 
 ---
 
-## Neyi gösteriyor?
+## Table of Contents
 
-- **Sıfırdan consistent hashing**: `ConsistentHashing` kütüphanesi, sanal düğümlü (virtual node) bir hash halkası. Dış bağımlılık yok.
-- **Gerçek sharding**: Her anahtar, halka tarafından **3 Postgres'ten birine** yönlendirilip orada saklanır. Okuma da aynı hesapla doğru shard'a gider.
-- **Dengeyi ölçen uç**: Binlerce rastgele anahtarın shard'lara ne kadar dengeli dağıldığını standart sapmayla raporlayan bir endpoint.
-- **Test edilmiş garanti**: Bir shard çıkınca anahtarların yalnızca küçük bir kısmının taşındığını kanıtlayan birim testleri.
+- [What it demonstrates](#what-it-demonstrates)
+- [Consistent hashing in 60 seconds](#consistent-hashing-in-60-seconds)
+- [Architecture](#architecture)
+- [Running it](#running-it)
+- [API endpoints](#api-endpoints)
+- [Things worth trying](#things-worth-trying)
+- [Project structure](#project-structure)
+- [Tests](#tests)
 
 ---
 
-## Consistent hashing 60 saniyede
+## What it demonstrates
 
-**Naif yöntemin sorunu:**
+- **Consistent hashing from scratch**: the `ConsistentHashing` library is a hash ring with virtual nodes. No external dependencies.
+- **Real sharding**: every key is routed by the ring to **one of three PostgreSQL** instances and stored there. Reads use the same computation to hit the correct shard.
+- **A balance-measuring endpoint**: reports how evenly thousands of random keys spread across the shards, using standard deviation.
+- **Tested guarantee**: unit tests prove that when a shard is removed, only a small fraction of keys are moved.
+
+---
+
+## Consistent hashing in 60 seconds
+
+**The problem with the naive approach:**
 
 ```
-shard = hash(key) % shard_sayısı
+shard = hash(key) % shard_count
 ```
 
-Bu çalışır, ama shard sayısı değişince (`% 3` → `% 4`) neredeyse **bütün** anahtarların yeri değişir — yani tüm veriyi taşımak gerekir. Cache için felaket: bir anda her şey "miss" olur.
+This works, but when the number of shards changes (`% 3` -> `% 4`), almost **all** keys change place — meaning you'd have to move all your data. For a cache, that's a disaster: suddenly everything is a "miss."
 
-**Consistent hashing'in çözümü:**
+**What consistent hashing does:**
 
-Hem shard'ları hem anahtarları çembersel bir "halkaya" yerleştir. Bir anahtarın sahibi, halkada saat yönünde ilerlerken karşılaşılan ilk shard'dır.
+Place both the shards and the keys on a circular "ring." A key's owner is the first shard you reach when walking clockwise.
 
 ```
         0 / max
-          •
+          .
     shard3   shard1
-       •       •
-        •     •
+       .       .
+        .     .
         shard2
 ```
 
-Bir shard eklenip çıkınca yalnızca **komşu yaydaki** anahtarlar (~%1/N) taşınır; gerisi yerinde kalır.
+When a shard is added or removed, only the keys in the **neighboring arc** (~1/N) move; the rest stay put.
 
-**Sanal düğümler (virtual nodes):** Her fiziksel shard'ı halkaya tek noktayla değil, yüzlerce noktayla koyarız. Böylece yük çok daha dengeli dağılır ve bir shard düşünce yükü tek komşuya değil, birçok shard'a yayılır. (Bu projede shard başına 150 sanal düğüm var.)
-
----
-
-## Mimari
-
-```
-                       ┌─────────────────────────────┐
-  HTTP (Swagger) ────► │      ShardingDemo.Api        │
-                       │                              │
-                       │   ShardRouter                │
-                       │   └─ ConsistentHashRing      │  ← anahtar → shard kararı
-                       │   ShardRepository (Npgsql)   │
-                       └───────┬───────┬───────┬──────┘
-                               │       │       │
-                          ┌────▼─┐ ┌───▼──┐ ┌──▼───┐
-                          │shard1│ │shard2│ │shard3│   ← 3 ayrı Postgres
-                          └──────┘ └──────┘ └──────┘
-```
-
-- **`ConsistentHashRing`** — saf algoritma, hiçbir altyapı bilmez. Tek işi: "bu anahtar hangi düğüme ait?"
-- **`ShardRouter`** — halkayı sarmalar, shard adını bağlantı dizesine eşler.
-- **`ShardRepository`** — kararı uygular: doğru Postgres'e bağlanıp okur/yazar (EF değil, şeffaflık için doğrudan Npgsql).
+**Virtual nodes:** each physical shard is placed on the ring not once, but hundreds of times. This spreads the load far more evenly, and when a shard goes down its load is distributed across many shards instead of a single neighbor. (In this project there are 150 virtual nodes per shard.)
 
 ---
 
-## Çalıştırma
+## Architecture
 
-### Gereksinim
-- [Docker](https://www.docker.com/) ve Docker Compose
+```
+                       +-----------------------------+
+  HTTP (Swagger) ----> |      ShardingDemo.Api       |
+                       |                             |
+                       |   ShardRouter               |
+                       |   +- ConsistentHashRing     |  <- key -> shard decision
+                       |   ShardRepository (Npgsql)  |
+                       +------+-------+-------+-------+
+                              |       |       |
+                          +---v--+ +--v---+ +-v----+
+                          |shard1| |shard2| |shard3|   <- 3 separate Postgres
+                          +------+ +------+ +------+
+```
 
-### Adımlar
+- **`ConsistentHashRing`** — the pure algorithm; knows nothing about infrastructure. Its only job: "which node owns this key?"
+- **`ShardRouter`** — wraps the ring and maps a shard name to its connection string.
+- **`ShardRepository`** — applies the decision: connects to the right Postgres and reads/writes (Npgsql directly instead of EF, for transparency).
+
+---
+
+## Running it
+
+### Requirements
+- [Docker](https://www.docker.com/) and Docker Compose
+
+### Steps
 
 ```bash
 docker compose up --build
 ```
 
-Hepsi ayağa kalkınca tarayıcıdan **Swagger UI**:
+Once everything is up, open the **Swagger UI** in your browser:
 
 ```
 http://localhost:8080/swagger
 ```
 
-İlk açılışta API, Postgres'ler hazır olana kadar bekleyip her shard'da tabloyu otomatik oluşturur.
+On first startup the API waits for the Postgres instances to become ready and automatically creates the table in each shard.
 
-### Docker olmadan (sadece API'yi lokal çalıştırmak)
+### Without Docker (running only the API locally)
 
-Önce Postgres'leri kaldırın, sonra API'yi `Development` profilinde çalıştırın:
+Bring up just the Postgres instances, then run the API in the `Development` profile:
 
 ```bash
 docker compose up shard1 shard2 shard3
 dotnet run --project src/ShardingDemo.Api
 ```
 
-`appsettings.Development.json` host portlarına (5432/5433/5434) bağlanır.
+`appsettings.Development.json` connects to the host ports (5432/5433/5434).
 
 ---
 
-## API uçları
+## API endpoints
 
-| Metot | Yol | Açıklama |
-|-------|-----|----------|
-| `POST` | `/api/data` | `{ "key": "...", "value": "..." }` — anahtarı doğru shard'a yazar, hangi shard'a gittiğini döndürür |
-| `GET`  | `/api/data/{key}` | Anahtarı bulunduğu shard'dan okur |
-| `GET`  | `/api/route/{key}` | DB'ye dokunmadan anahtarın hangi shard'a gideceğini hesaplar |
-| `GET`  | `/api/shards` | Shard listesi + her birindeki anahtar sayısı |
-| `GET`  | `/api/simulate/distribution?count=10000` | N rastgele anahtarın dağılımını + standart sapmasını ölçer |
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/data` | `{ "key": "...", "value": "..." }` — writes the key to the correct shard and returns which shard it went to |
+| `GET`  | `/api/data/{key}` | Reads the key from the shard it lives on |
+| `GET`  | `/api/route/{key}` | Computes which shard the key would go to, without touching the DB |
+| `GET`  | `/api/shards` | List of shards + key count in each |
+| `GET`  | `/api/simulate/distribution?count=10000` | Measures the distribution of N random keys + standard deviation |
 
-### Örnek
+### Example
 
 ```bash
-# Yaz
+# Write
 curl -X POST http://localhost:8080/api/data \
   -H "Content-Type: application/json" \
-  -d '{"key":"kullanici:42","value":"Ahmet"}'
-# → { "key": "kullanici:42", "shard": "shard2" }
+  -d '{"key":"user:42","value":"Alice"}'
+# -> { "key": "user:42", "shard": "shard2" }
 
-# Oku
-curl http://localhost:8080/api/data/kullanici:42
-# → { "key": "kullanici:42", "value": "Ahmet", "shard": "shard2" }
+# Read
+curl http://localhost:8080/api/data/user:42
+# -> { "key": "user:42", "value": "Alice", "shard": "shard2" }
 ```
 
 ---
 
-## Denemeye değer senaryolar
+## Things worth trying
 
-1. **Dağılım dengesi:** `GET /api/simulate/distribution?count=100000` çağırın. Üç shard'ın da yaklaşık %33'er pay aldığını ve standart sapmanın küçük olduğunu görün.
-2. **Tutarlılık:** Aynı anahtarı `/api/route/{key}` ile defalarca sorgulayın — hep aynı shard döner.
-3. **Gerçekten dağıtıldı mı?** Birkaç kayıt yazdıktan sonra her Postgres'e ayrı ayrı bağlanıp `SELECT * FROM kv;` çalıştırın; verinin üç DB'ye yayıldığını doğrulayın:
+1. **Distribution balance:** call `GET /api/simulate/distribution?count=100000`. Notice that all three shards get roughly 33% each and the standard deviation is small.
+2. **Consistency:** query the same key via `/api/route/{key}` repeatedly — it always returns the same shard.
+3. **Is it really distributed?** After writing a few records, connect to each Postgres individually and run `SELECT * FROM kv;` to confirm the data is spread across all three databases:
    ```bash
    docker exec -it $(docker compose ps -q shard1) psql -U postgres -d shard -c "SELECT * FROM kv;"
    ```
 
 ---
 
-## Proje yapısı
+## Project structure
 
 ```
 sharding-demo/
@@ -156,30 +156,30 @@ sharding-demo/
 ├── Dockerfile
 ├── ShardingDemo.sln
 ├── src/
-│   ├── ConsistentHashing/      # ⭐ Algoritma (bağımsız kütüphane)
+│   ├── ConsistentHashing/      # The algorithm (standalone library)
 │   │   ├── ConsistentHashRing.cs
 │   │   ├── IHashFunction.cs
 │   │   └── Md5HashFunction.cs
 │   └── ShardingDemo.Api/       # Web API
-│       ├── Program.cs          # endpoint'ler
-│       ├── ShardRouter.cs      # anahtar → shard
-│       └── ShardRepository.cs  # doğru Postgres'e okuma/yazma
+│       ├── Program.cs          # endpoints
+│       ├── ShardRouter.cs      # key -> shard
+│       └── ShardRepository.cs  # reads/writes to the right Postgres
 └── tests/
     └── ConsistentHashing.Tests/
 ```
 
 ---
 
-## Testler
+## Tests
 
 ```bash
 dotnet test
 ```
 
-Kapsanan garantiler: aynı anahtarın hep aynı düğüme gitmesi, dağılımın dengeli olması ve **bir düğüm çıkınca yalnızca etkilenen anahtarların taşınması** (consistent hashing'in asıl vaadi).
+Guarantees covered: the same key always maps to the same node, the distribution is balanced, and **when a node is removed, only the affected keys move** (the core promise of consistent hashing).
 
 ---
 
-## Notlar / sınırlamalar
+## Notes / limitations
 
-Bu bir **öğretici demo**. Üretim için eksik olan başlıca şeyler: shard yeniden dengeleme sırasında veri taşıma (rebalancing), çoğaltma (replication), bağlantı havuzu ayarları, hata/yeniden deneme politikaları ve güvenlik. Amaç algoritmayı ve sharding fikrini net göstermek.
+This is a **teaching demo**. The main things missing for production: data migration during shard rebalancing, replication, connection-pool tuning, error/retry policies, and security. The point is to show the algorithm and the idea of sharding clearly.
